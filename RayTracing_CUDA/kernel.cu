@@ -2,120 +2,153 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
-#include <stdio.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+#include <iostream>
+#include <time.h>
+#include "vec3.h"
+#include "ray.h"
+#include "sphere.h"
+#include "hitable_list.h"
+
+// limited version of checkCudaErrors from helper_cuda.h in CUDA examples
+#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
+
+void check_cuda(cudaError_t result, char const* const func, const char* const file, int const line) {
+    if (result) {
+        std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << " at " <<
+            file << ":" << line << " '" << func << "' \n";
+        // Make sure we call CUDA Device Reset before exiting
+        cudaDeviceReset();
+        exit(99);
+    }
 }
 
-int main()
-{
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
+__device__ vec3 color(const ray& r, hitable **world) {
+    hit_record rec;
+    if ((*world)->hit(r, 0.0, FLT_MAX, rec)) {
+        return 0.5f * vec3(rec.normal.x() + 1, rec.normal.y() + 1.0f, rec.normal.z() + 1.0f);
     }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
+    else {
+        vec3 unit_direction = unit_vector(r.direction());
+        float t = 0.5f * (unit_direction.y() + 1.0f);
+        return (1.0f - t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
     }
-
-    return 0;
 }
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
+__global__ void render(vec3* fb, int max_x, int max_y,
+    vec3 lower_left_corner, vec3 horizontal, vec3 vertical, vec3 origin, hitable **world) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    if ((i >= max_x) || (j >= max_y)) return;
+    int pixel_index = j * max_x + i;
+    float u = float(i) / float(max_x);
+    float v = float(j) / float(max_y);
+    ray r(origin, lower_left_corner + u * horizontal + v * vertical);
+    fb[pixel_index] = color(r, world);
+}
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
+__global__ void create_world(hitable** d_list, hitable** d_world) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *(d_list) = new sphere(vec3(0, 0, -1), 0.5);
+        *(d_list + 1) = new sphere(vec3(0, -100.5, -1), 100);
+        *d_world = new hitable_list(d_list, 2);
+    }
+}
+
+__global__ void free_world(hitable** d_list, hitable** d_world) {
+    delete* (d_list);
+    delete* (d_list + 1);
+    delete* d_world;
+}
+
+int main() {
+    // 윈도우 크기.
+    int nx = 1200;
+    int ny = 600;
+    int tx = 8;
+    int ty = 8;
+
+    std::cerr << "Rendering a " << nx << "x" << ny << " image ";
+    std::cerr << "in " << tx << "x" << ty << " blocks.\n";
+
+    int num_pixels = nx * ny;
+    size_t fb_size = num_pixels * sizeof(vec3);
+
+    // allocate FB
+    vec3* fb;
+    checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+
+    // make our world of hitables
+    hitable** d_list;
+    checkCudaErrors(cudaMalloc((void**)&d_list, 2 * sizeof(hitable*)));
+    hitable** d_world;
+    checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hitable*)));
+    create_world << <1, 1 >> > (d_list, d_world);
+
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    clock_t start, stop;
+    start = clock();
+    // Render our buffer
+    dim3 blocks(nx / tx + 1, ny / ty + 1);
+    dim3 threads(tx, ty);
+    render << <blocks, threads >> > (fb, nx, ny,
+                                    vec3(-2.0, -1.0, -1.0),
+                                    vec3(4.0, 0.0, 0.0),
+                                    vec3(0.0, 2.0, 0.0),
+                                    vec3(0.0, 0.0, 0.0),
+                                    d_world);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    stop = clock();
+    double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+    std::cerr << "took " << timer_seconds << " seconds.\n";
+
+    // output image file 
+    const char* outputFileName = "output.png";
+    int n_comp = 3;
+    unsigned char* ptr_data_o =
+        (unsigned char*)malloc(n_comp * nx * ny * sizeof(unsigned char));
+
+    // Output FB as Image
+    // std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    // 이미지 만들기 
+    std::cout << "image save .. " << std::endl;
+    int reverse_index = 0;
+    for (int j = ny - 1; j >= 0; j--) {
+        for (int i = 0; i < nx; i++) {
+
+            int index =
+                n_comp * (reverse_index * nx + i);
+
+            size_t pixel_index = j * nx + i;
+            int ir = int(255.99 * fb[pixel_index].r());
+            int ig = int(255.99 * fb[pixel_index].g());
+            int ib = int(255.99 * fb[pixel_index].b());
+
+            ptr_data_o[index + 0] = ir;
+            ptr_data_o[index + 1] = ig;
+            ptr_data_o[index + 2] = ib;
+            // std::cout << ir << " " << ig << " " << ib << "\n";
+        }
+        reverse_index++;
     }
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+    int exported_img = stbi_write_png(outputFileName, nx, ny, n_comp, ptr_data_o, 0);
+    checkCudaErrors(cudaDeviceSynchronize());
+    free_world << <1, 1 >> > (d_list, d_world);
+    free(ptr_data_o);
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(fb));
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+    cudaDeviceReset();
 }
